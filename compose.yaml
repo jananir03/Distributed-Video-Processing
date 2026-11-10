@@ -1,0 +1,338 @@
+
+name: distributed-video-platform
+
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-video_platform}
+      MYSQL_USER: ${MYSQL_USER:?Set MYSQL_USER in .env}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
+    ports:
+      - "${MYSQL_HOST_PORT:-3307}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'mysqladmin ping -h 127.0.0.1 -uroot -p"$${MYSQL_ROOT_PASSWORD}" --silent'
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - video_net
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?Set RABBITMQ_DEFAULT_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?Set RABBITMQ_DEFAULT_PASS in .env}
+    ports:
+      - "${RABBITMQ_AMQP_HOST_PORT:-5673}:5672"
+      - "${RABBITMQ_MANAGEMENT_HOST_PORT:-15673}:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - video_net
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    ports:
+      - "${REDIS_HOST_PORT:-6380}:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - video_net
+
+  video_upload:
+    build:
+      context: .
+      dockerfile: backend/services/video_upload/Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SERVICE_NAME: video-upload
+      DATABASE_URL: "mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/video_upload_db"
+      RABBITMQ_URL: "amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/%2F"
+      REDIS_URL: redis://redis:6379/0
+      MEDIA_ROOT: /app/media
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-500}
+      ALLOWED_VIDEO_EXTENSIONS: ${ALLOWED_VIDEO_EXTENSIONS:-.mp4,.mov,.mkv,.webm,.avi}
+      FFMPEG_BINARY: ${FFMPEG_BINARY:-ffmpeg}
+      FFPROBE_BINARY: ${FFPROBE_BINARY:-ffprobe}
+      FFMPEG_TIMEOUT_SECONDS: ${FFMPEG_TIMEOUT_SECONDS:-3600}
+    ports:
+      - "${VIDEO_UPLOAD_HOST_PORT:-8010}:8000"
+    volumes:
+      - ./docker/media:/app/media
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - video_net
+
+  video_metadata:
+    build:
+      context: .
+      dockerfile: backend/services/video_metadata/Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      SERVICE_NAME: video-metadata
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: "mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/video_metadata_db"
+      RABBITMQ_URL: "amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/%2F"
+      REDIS_URL: redis://redis:6379/0
+      MEDIA_ROOT: /app/media
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-500}
+      ALLOWED_VIDEO_EXTENSIONS: ${ALLOWED_VIDEO_EXTENSIONS:-.mp4,.mov,.mkv,.webm,.avi}
+    ports:
+      - "8011:8000"
+    volumes:
+      - ./docker/media:/app/media:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      video_upload:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - video_net
+
+  transcoding_orchestrator:
+    build:
+      context: .
+      dockerfile: backend/services/transcoding_orchestrator/Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      SERVICE_NAME: transcoding-orchestrator
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: "mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/transcoding_orchestrator_db"
+      RABBITMQ_URL: "amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/%2F"
+      DEFAULT_PROFILES: ${TRANSCODING_PROFILES:-360p,480p,720p}
+      JOB_MAX_ATTEMPTS: ${TRANSCODING_JOB_MAX_ATTEMPTS:-3}
+      OUTBOX_POLL_SECONDS: ${TRANSCODING_OUTBOX_POLL_SECONDS:-2}
+      CONSUMER_PREFETCH: ${TRANSCODING_CONSUMER_PREFETCH:-10}
+    ports:
+      - "8012:8000"
+    volumes:
+      - ./docker/media:/app/media:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - video_net
+
+  transcoding_worker:
+    build:
+      context: .
+      dockerfile: backend/services/transcoding_worker/Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      SERVICE_NAME: video-transcoding-worker
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: "mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/transcoding_worker_db"
+      ORCHESTRATOR_DATABASE_URL: "mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/transcoding_orchestrator_db"
+      RABBITMQ_URL: "amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/%2F"
+      MEDIA_ROOT: /app/media
+      OUTPUT_SUBDIRECTORY: transcoded
+      MAX_ATTEMPTS: ${TRANSCODING_JOB_MAX_ATTEMPTS:-3}
+      RETRY_DELAY_SECONDS: 2
+      JOB_TIMEOUT_SECONDS: 3600
+    ports:
+      - "8013:8000"
+    volumes:
+      - ./docker/media:/app/media
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      transcoding_orchestrator:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - video_net
+
+  thumbnail_service:
+    build:
+      context: .
+      dockerfile: backend/services/thumbnail_generation/Dockerfile
+    restart: unless-stopped
+    environment:
+      SERVICE_NAME: thumbnail-service
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: "mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/thumbnail_db"
+      WORKER_DATABASE_URL: "mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/transcoding_worker_db"
+      MEDIA_ROOT: /app/media
+      POLL_INTERVAL_SECONDS: ${THUMBNAIL_POLL_INTERVAL_SECONDS:-10}
+      BATCH_SIZE: ${THUMBNAIL_BATCH_SIZE:-50}
+      MAX_ATTEMPTS: ${THUMBNAIL_MAX_ATTEMPTS:-3}
+      COMMAND_TIMEOUT_SECONDS: ${THUMBNAIL_COMMAND_TIMEOUT_SECONDS:-120}
+      THUMBNAIL_SEEK_SECONDS: ${THUMBNAIL_SEEK_SECONDS:-1.0}
+    ports:
+      - "8014:8000"
+    volumes:
+      - ./docker/media:/app/media
+    depends_on:
+      mysql:
+        condition: service_healthy
+      transcoding_worker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - video_net
+
+  media_delivery:
+    build:
+      context: .
+      dockerfile: backend/services/media_delivery/Dockerfile
+    restart: unless-stopped
+    environment:
+      SERVICE_NAME: media-delivery
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      WORKER_DATABASE_URL: "mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/transcoding_worker_db"
+      MEDIA_ROOT: /app/media
+      MAX_PAGE_SIZE: ${MEDIA_DELIVERY_MAX_PAGE_SIZE:-100}
+      STREAM_CACHE_CONTROL: ${MEDIA_DELIVERY_CACHE_CONTROL:-private, no-cache}
+    ports:
+      - "8015:8000"
+    volumes:
+      - ./docker/media:/app/media:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - video_net
+
+  api_gateway:
+    build:
+      context: .
+      dockerfile: backend/services/api_gateway/Dockerfile
+    restart: unless-stopped
+    environment:
+      SERVICE_NAME: api-gateway
+      APP_ENV: ${APP_ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      VIDEO_UPLOAD_URL: http://video_upload:8000
+      VIDEO_METADATA_URL: http://video_metadata:8000
+      TRANSCODING_ORCHESTRATOR_URL: http://transcoding_orchestrator:8000
+      MEDIA_DELIVERY_URL: http://media_delivery:8000
+      THUMBNAIL_SERVICE_URL: http://thumbnail_service:8000
+      OPENAPI_TIMEOUT_SECONDS: ${GATEWAY_OPENAPI_TIMEOUT_SECONDS:-8}
+      REQUEST_TIMEOUT_SECONDS: ${GATEWAY_REQUEST_TIMEOUT_SECONDS:-120}
+      CONNECT_TIMEOUT_SECONDS: ${GATEWAY_CONNECT_TIMEOUT_SECONDS:-5}
+      MAX_CONNECTIONS: ${GATEWAY_MAX_CONNECTIONS:-200}
+      MAX_KEEPALIVE_CONNECTIONS: ${GATEWAY_MAX_KEEPALIVE_CONNECTIONS:-40}
+      CORS_ORIGINS: ${GATEWAY_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+    ports:
+      - "${API_GATEWAY_HOST_PORT:-8000}:8000"
+    depends_on:
+      video_upload:
+        condition: service_healthy
+      video_metadata:
+        condition: service_healthy
+      transcoding_orchestrator:
+        condition: service_healthy
+      media_delivery:
+        condition: service_healthy
+      thumbnail_service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - video_net
+
+networks:
+  video_net:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  rabbitmq_data:
+  redis_data:
